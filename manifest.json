@@ -1,0 +1,4 @@
+{
+  "entry": "python/pythonw.exe",
+  "args": ["__main__.pyc"]
+}

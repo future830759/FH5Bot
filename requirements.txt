@@ -1,0 +1,11 @@
+opencv-python
+numpy
+pyautogui
+keyboard
+pillow
+pyscreeze
+pygetwindow
+mouseinfo
+pymsgbox
+mss
+pynput
