@@ -4,7 +4,6 @@
 # 注意：請使用 UTF-8（無 BOM）
 # =====================================================
 
-# ---------- PowerShell / Encoding ----------
 try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -35,7 +34,7 @@ function Confirm-YesNo([string]$prompt) {
     }
 }
 
-function Prompt-Version([string]$latestRemote) {
+function Prompt-Version {
     $msg = "請輸入要發佈的新版本號 (x.y.z)"
     while ($true) {
         $v = Read-Host $msg
@@ -47,26 +46,13 @@ function Prompt-Version([string]$latestRemote) {
 function Update-VersionFiles([string]$newVersion) {
     $changed = @()
 
+    # ✅ 只更新 version.txt（不再動 version.json）
     if (Test-Path ".\version.txt") {
         Set-Content -Path ".\version.txt" -Value $newVersion -Encoding UTF8
         $changed += "version.txt"
     }
 
-    if (Test-Path ".\version.json") {
-        try {
-            $obj = Get-Content ".\version.json" -Raw | ConvertFrom-Json
-            if ($obj -and $obj.PSObject.Properties.Name -contains "version") {
-                $obj.version = $newVersion
-                ($obj | ConvertTo-Json -Depth 10) | Set-Content ".\version.json" -Encoding UTF8
-                $changed += "version.json"
-            } else {
-                # 沒有 version 欄位就不動它
-            }
-        } catch {
-            # version.json 不是標準 JSON 或其他原因，就不動它
-        }
-    }
-
+    # manifest.json 若有 version/Version 才更新，沒有就略過（不影響打包）
     if (Test-Path ".\manifest.json") {
         try {
             $m = Get-Content ".\manifest.json" -Raw | ConvertFrom-Json
@@ -89,11 +75,10 @@ function Update-VersionFiles([string]$newVersion) {
 }
 
 function Get-ChangedAllowedFiles {
-    # 只檢查允許清單內的異動（避免把不該 commit 的東西一起帶進去）
+    # ✅ version.json 已不再更新，所以也不需要列入 allow
     $allow = @(
         "build_app.ps1",
         "version.txt",
-        "version.json",
         "manifest.json"
     )
 
@@ -124,7 +109,6 @@ function Auto-Commit-IfNeeded([string[]]$files, [string]$reason, [string]$commit
 }
 
 function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
-    # 需要：GitHub CLI (gh) 已登入
     try {
         $gh = Get-Command gh -ErrorAction SilentlyContinue
         if (-not $gh) {
@@ -156,32 +140,26 @@ function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
 function Sync-TagsFromRemote {
     Write-Host "正在同步遠端 tags（包含清掉本地已不存在的 tags）..." -ForegroundColor Cyan
 
-    # 優先：新版 git 支援 prune-tags
     git fetch $REMOTE --tags --prune --prune-tags 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "遠端 tags 同步完成（使用 --prune-tags）。" -ForegroundColor Cyan
         return
     }
 
-    # fallback：舊 git 不支援 --prune-tags
     Write-Host "提示：你的 git 可能不支援 --prune-tags，改用 fallback 同步法。" -ForegroundColor Yellow
 
-    # 1) 取遠端 tags
     $remoteTags = @{}
     git ls-remote --tags $REMOTE 2>$null | ForEach-Object {
-        # 格式：<sha>\trefs/tags/v1.0.0  或 refs/tags/v1.0.0^{}
         $parts = $_ -split "\s+"
         if ($parts.Count -lt 2) { return }
         $ref = $parts[1]
         if ($ref -match '^refs/tags/(.+)$') {
             $t = $Matches[1]
-            # 去掉 annotated tag 的 ^{}
             $t = $t -replace '\^\{\}$',''
             if ($t) { $remoteTags[$t] = $true }
         }
     }
 
-    # 2) 刪掉本地多餘 tags（只針對 vX.Y.Z）
     $localTags = git tag | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
     foreach ($t in $localTags) {
         if (-not $remoteTags.ContainsKey($t)) {
@@ -190,7 +168,6 @@ function Sync-TagsFromRemote {
         }
     }
 
-    # 3) 再 fetch tags（補齊遠端 tags）
     git fetch $REMOTE --tags 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "同步遠端 tags 失敗（fallback）" }
 
@@ -205,33 +182,68 @@ function Get-RemoteLatestVersionOnly {
 }
 
 # =====================================================
+# Build helpers
+# =====================================================
+function Get-PythonCmd {
+    $PY = (Get-Command python -ErrorAction SilentlyContinue)
+    if (-not $PY) { throw "找不到 python，請先安裝/設定 PATH" }
+    return $PY
+}
+
+function Build-MainPyc([string]$outPath) {
+    # ✅ 若根目錄沒有 __main__.py，也能用 main.py 直接編譯成 __main__.pyc
+    $candidates = @(
+        (Join-Path $SRC "__main__.py"),
+        (Join-Path $SRC "main.py")
+    )
+
+    $srcFile = $null
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { $srcFile = $c; break }
+    }
+    if (-not $srcFile) {
+        throw "找不到入口 .py（需要 __main__.py 或 main.py 其中之一）"
+    }
+
+    $py = Get-PythonCmd
+
+    $pycode = @'
+import sys, py_compile
+src = sys.argv[1]
+out = sys.argv[2]
+# dfile 讓它以 __main__.py 的身份編譯（符合你的 entry 模式）
+py_compile.compile(src, cfile=out, dfile="__main__.py")
+print("compiled:", src, "->", out)
+'@
+
+    & python -c $pycode $srcFile $outPath | Out-Null
+    if (-not (Test-Path $outPath)) {
+        throw "編譯 __main__.pyc 失敗：$outPath"
+    }
+}
+
+# =====================================================
 # Main
 # =====================================================
 
-# 先處理「腳本本身」若有改動：允許自動 commit
 $dirtyAllowed = Get-ChangedAllowedFiles
 Auto-Commit-IfNeeded `
   -files $dirtyAllowed `
   -reason "腳本或版本檔異動" `
   -commitMessage "chore: update release script / version files"
 
-# ✅ 只信遠端：執行時同步 tags（包含刪掉本地殘留）
 Sync-TagsFromRemote
 
-# ✅ 只用遠端同步後的結果（不再 fallback 本地）
 $LATEST = Get-RemoteLatestVersionOnly
 Write-Host ("GitHub 最新版本（遠端）：{0}" -f ($LATEST ? $LATEST : "0"))
 
-# 輸入新版本
-$newVersion = Prompt-Version $LATEST
+$newVersion = Prompt-Version
 $TAG = "v$newVersion"
 Write-Host "即將發佈版本：$newVersion" -ForegroundColor Green
 
-# [1/8] 更新版本檔
 Write-Host "[1/8] 更新版本檔..."
 $updatedFiles = Update-VersionFiles $newVersion
 
-# 若版本檔有異動，建議先 commit
 if ($updatedFiles -and $updatedFiles.Count -gt 0) {
     Write-Host "版本檔已更新，建議先 commit 再打 tag/發佈：" -ForegroundColor Cyan
     foreach ($f in $updatedFiles) { Write-Host " - $f" }
@@ -246,53 +258,39 @@ if ($updatedFiles -and $updatedFiles.Count -gt 0) {
     if ($LASTEXITCODE -ne 0) { throw "git push 失敗" }
 }
 
-# [2/8] 建立 tag（本地）
 Write-Host "[2/8] 建立 tag..."
 git tag $TAG
 if ($LASTEXITCODE -ne 0) { throw "建立 tag 失敗：$TAG" }
 
-# [3/8] 推送 tag
 Write-Host "[3/8] 推送 tag..."
 git push $REMOTE $TAG
 if ($LASTEXITCODE -ne 0) { throw "推送 tag 失敗：$TAG" }
 
-# --------- 以下為打包流程 ---------
-
 $APP_RELEASE = Join-Path $SRC "app_release"
 
-# 路徑準備
 if (Test-Path $APP_RELEASE) { Remove-Item $APP_RELEASE -Recurse -Force }
 New-Item -ItemType Directory -Path $APP_RELEASE | Out-Null
-
 New-Item -ItemType Directory -Path (Join-Path $APP_RELEASE "bot") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path (Join-Path $APP_RELEASE "bot") "__pycache__") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $APP_RELEASE "assets") | Out-Null
 
-# [4/8] 編譯 .py -> .pyc
 Write-Host "[4/8] 編譯 .py -> .pyc..."
-$PY = (Get-Command python -ErrorAction SilentlyContinue)
-if (-not $PY) { throw "找不到 python，請先安裝/設定 PATH" }
-
+Get-PythonCmd | Out-Null
 python -m compileall . | Out-Null
 
-# [5/8] 複製 .pyc（__main__ + bot）
 Write-Host "[5/8] 複製 .pyc..."
-$LAUNCHER_PYCACHE = Join-Path $SRC "__pycache__"                 # 專案根目錄 __pycache__
 $BOT_PYCACHE      = Join-Path (Join-Path $SRC "bot") "__pycache__"
+Ensure-FileExists $BOT_PYCACHE "找不到 bot\__pycache__：$BOT_PYCACHE（請確認 bot 模組已 compileall）"
 
-Ensure-FileExists $LAUNCHER_PYCACHE "找不到 __pycache__：$LAUNCHER_PYCACHE（請確認已 compileall）"
-Ensure-FileExists $BOT_PYCACHE      "找不到 bot\__pycache__：$BOT_PYCACHE（請確認 bot 模組已 compileall）"
-
-# __main__.pyc（entrypoint）
-$mainPyc = Get-ChildItem "$LAUNCHER_PYCACHE\__main__*.pyc" -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $mainPyc) { throw "找不到 __main__ 的 .pyc（__pycache__\__main__*.pyc）" }
-Copy-Item $mainPyc.FullName (Join-Path $APP_RELEASE "__main__.pyc") -Force
+# ✅ 直接生成 app_release\__main__.pyc（不再依賴 __pycache__\__main__*.pyc）
+$mainOut = Join-Path $APP_RELEASE "__main__.pyc"
+Build-MainPyc -outPath $mainOut
 
 # bot\__init__.py（確保 bot 是 package）
 if (-not (Test-Path ".\bot\__init__.py")) { throw "找不到 bot\__init__.py" }
 Copy-Item ".\bot\__init__.py" (Join-Path (Join-Path $APP_RELEASE "bot") "__init__.py") -Force
 
-# bot\__pycache__\__init__*.pyc（保留原檔名，例如 __init__.cpython-311.pyc）
+# bot\__pycache__\__init__*.pyc（保留原檔名）
 $initPyc = Get-ChildItem "$BOT_PYCACHE\__init__*.pyc" -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $initPyc) { throw "找不到 bot 的 __init__.pyc（bot\__pycache__\__init__*.pyc）" }
 Copy-Item $initPyc.FullName (Join-Path (Join-Path (Join-Path $APP_RELEASE "bot") "__pycache__") $initPyc.Name) -Force
@@ -303,16 +301,13 @@ Get-ChildItem "$BOT_PYCACHE\*.pyc" | ForEach-Object {
     Copy-Item $_.FullName (Join-Path (Join-Path $APP_RELEASE "bot") $name) -Force
 }
 
-# [6/8] 複製資源
 Write-Host "[6/8] 複製資源..."
 Ensure-FileExists ".\assets" "找不到 .\assets，請確認資源資料夾存在。"
 Copy-Item ".\assets\*" (Join-Path $APP_RELEASE "assets") -Recurse -Force
 if (Test-Path ".\default_config.json") { Copy-Item ".\default_config.json" $APP_RELEASE -Force }
 if (Test-Path ".\manifest.json")       { Copy-Item ".\manifest.json"       $APP_RELEASE -Force }
 if (Test-Path ".\version.txt")         { Copy-Item ".\version.txt"         $APP_RELEASE -Force }
-# (已移除) 不再打包 version.json
 
-# [7/8] 打包 zip（只打包 app_release 的內容）
 Write-Host "[7/8] 打包 zip..."
 $DIST_ZIP = Join-Path $DIST_DIR ("FH5Bot_{0}.zip" -f $TAG)
 if (Test-Path $DIST_ZIP) { Remove-Item $DIST_ZIP -Force }
@@ -322,7 +317,7 @@ Write-Host "=== 本機打包完成 ===" -ForegroundColor Green
 Write-Host "產出檔案：" $DIST_ZIP
 Write-Host "GitHub tag：" $TAG
 
-# [8/8] 是否上傳 GitHub Release
+Write-Host "[8/8] 是否要建立/更新 GitHub Release 並上傳這包 zip？"
 $doUpload = Confirm-YesNo "是否要建立/更新 GitHub Release 並上傳這包 zip？(Y/N)"
 if ($doUpload) {
     Try-Upload-GitHubRelease -tag $TAG -zipPath $DIST_ZIP
