@@ -75,7 +75,6 @@ function Update-VersionFiles([string]$newVersion) {
 }
 
 function Get-ChangedAllowedFiles {
-    # ✅ version.json 已不再更新，所以也不需要列入 allow
     $allow = @(
         "build_app.ps1",
         "version.txt",
@@ -191,7 +190,6 @@ function Get-PythonCmd {
 }
 
 function Build-MainPyc([string]$outPath) {
-    # ✅ 若根目錄沒有 __main__.py，也能用 main.py 直接編譯成 __main__.pyc
     $candidates = @(
         (Join-Path $SRC "__main__.py"),
         (Join-Path $SRC "main.py")
@@ -205,13 +203,12 @@ function Build-MainPyc([string]$outPath) {
         throw "找不到入口 .py（需要 __main__.py 或 main.py 其中之一）"
     }
 
-    $py = Get-PythonCmd
+    Get-PythonCmd | Out-Null
 
     $pycode = @'
 import sys, py_compile
 src = sys.argv[1]
 out = sys.argv[2]
-# dfile 讓它以 __main__.py 的身份編譯（符合你的 entry 模式）
 py_compile.compile(src, cfile=out, dfile="__main__.py")
 print("compiled:", src, "->", out)
 '@
@@ -271,7 +268,6 @@ $APP_RELEASE = Join-Path $SRC "app_release"
 if (Test-Path $APP_RELEASE) { Remove-Item $APP_RELEASE -Recurse -Force }
 New-Item -ItemType Directory -Path $APP_RELEASE | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $APP_RELEASE "bot") | Out-Null
-New-Item -ItemType Directory -Path (Join-Path (Join-Path $APP_RELEASE "bot") "__pycache__") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $APP_RELEASE "assets") | Out-Null
 
 Write-Host "[4/8] 編譯 .py -> .pyc..."
@@ -279,24 +275,27 @@ Get-PythonCmd | Out-Null
 python -m compileall . | Out-Null
 
 Write-Host "[5/8] 複製 .pyc..."
-$BOT_PYCACHE      = Join-Path (Join-Path $SRC "bot") "__pycache__"
+$BOT_PYCACHE = Join-Path (Join-Path $SRC "bot") "__pycache__"
 Ensure-FileExists $BOT_PYCACHE "找不到 bot\__pycache__：$BOT_PYCACHE（請確認 bot 模組已 compileall）"
 
 # ✅ 直接生成 app_release\__main__.pyc（不再依賴 __pycache__\__main__*.pyc）
 $mainOut = Join-Path $APP_RELEASE "__main__.pyc"
 Build-MainPyc -outPath $mainOut
 
-# bot\__init__.py（確保 bot 是 package）
-if (-not (Test-Path ".\bot\__init__.py")) { throw "找不到 bot\__init__.py" }
-Copy-Item ".\bot\__init__.py" (Join-Path (Join-Path $APP_RELEASE "bot") "__init__.py") -Force
+# -----------------------------------------------------
+# bot package：自動生成 __init__.py（不再要求 src 內存在）
+# -----------------------------------------------------
 
-# bot\__pycache__\__init__*.pyc（保留原檔名）
-$initPyc = Get-ChildItem "$BOT_PYCACHE\__init__*.pyc" -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $initPyc) { throw "找不到 bot 的 __init__.pyc（bot\__pycache__\__init__*.pyc）" }
-Copy-Item $initPyc.FullName (Join-Path (Join-Path (Join-Path $APP_RELEASE "bot") "__pycache__") $initPyc.Name) -Force
+# ✅ 一律在 app_release\bot\__init__.py 生成（空檔即可）
+$botInitOut = Join-Path (Join-Path $APP_RELEASE "bot") "__init__.py"
+New-Item -ItemType File -Path $botInitOut -Force | Out-Null
 
-# bot\*.pyc（改名去掉 cpython-311 後綴，放在 bot\ 目錄）
-Get-ChildItem "$BOT_PYCACHE\*.pyc" | ForEach-Object {
+# ✅ 不再打包 bot\__pycache__\__init__*.pyc（讓執行時自行生成即可）
+
+# -----------------------------------------------------
+# bot\*.pyc：照常複製（排除 __init__ 的 pyc）
+# -----------------------------------------------------
+Get-ChildItem "$BOT_PYCACHE\*.pyc" | Where-Object { $_.Name -notmatch '^__init__\.' } | ForEach-Object {
     $name = ($_.BaseName -replace '\.cpython-\d+$','') + ".pyc"
     Copy-Item $_.FullName (Join-Path (Join-Path $APP_RELEASE "bot") $name) -Force
 }
