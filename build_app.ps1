@@ -1,252 +1,162 @@
 ﻿# =====================================================
 # FH5Bot 發佈腳本（互動式 Auto Commit + 可選 GitHub Release 上傳）
-# 目的：本機打包的 zip = GitHub Release 資產 zip（完全一致）
+# 目的：本機打 tag + 推 tag + 產出 release zip（只含 runtime 需要的檔案）
+# 注意：請使用 UTF-8（無 BOM）
 # =====================================================
 
-$ErrorActionPreference = "Stop"
-
-# ---------- 盡量確保主控台能輸出中文 ----------
+# ---------- PowerShell / Encoding ----------
 try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-} catch { }
+} catch {}
 
-# ===== 強制 PowerShell 7+（中文提示，避免 emoji）=====
-if ($PSVersionTable.PSVersion.Major -lt 7) {
-    Write-Host "錯誤：請使用 PowerShell 7+（pwsh）執行此腳本。" -ForegroundColor Red
-    Write-Host "請在 Windows Terminal 或 PowerShell 7 開啟後執行：pwsh -File .\build_app.ps1" -ForegroundColor Yellow
-    exit 1
-}
+$ErrorActionPreference = "Stop"
 
-function Get-DefaultRemoteName {
-    # 優先使用 origin，否則取第一個 remote
-    $remotes = @(git remote 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $remotes -or $remotes.Count -eq 0) { return "origin" }
-    if ($remotes -contains "origin") { return "origin" }
-    return $remotes[0]
-}
-
-$REMOTE = Get-DefaultRemoteName
-
-# ================== 參數 / 專案設定 ==================
-$SRC = (Get-Location).Path
-
+# ---------- 基本設定 ----------
+$REMOTE = "origin"
 $GITHUB_OWNER = "future830759"
 $GITHUB_REPO  = "FH5Bot"
 
-# 允許自動 commit 的檔案（版本 + 發佈腳本本身）
-$ALLOWED_AUTO_COMMIT = @("version.txt", "version.json", "manifest.json", "build_app.ps1")
+$SRC = (Get-Location).Path
+$DIST_DIR = Join-Path $SRC "dist"
+New-Item -ItemType Directory -Path $DIST_DIR -Force | Out-Null
 
-# ---------- functions ----------
-function Validate-SemVer([string]$v) {
-    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
-    return ($v -match '^\d+\.\d+\.\d+$')
+# ---------- 小工具 ----------
+function Ensure-FileExists($path, $msg) {
+    if (-not (Test-Path $path)) { throw $msg }
 }
 
-function Ensure-GitRepo {
-    git rev-parse --is-inside-work-tree *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw "目前資料夾不是 Git repo（找不到 .git）。請切到真正的專案根目錄再執行。"
-    }
-}
-
-function Ensure-RemoteOrigin {
-    # 兼容舊函式名稱：實際檢查使用自動偵測到的 $REMOTE
-    $u = git remote get-url $REMOTE 2>$null
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($u)) {
-        throw "找不到 remote '$REMOTE'。請先設定：git remote add origin <repo-url>（或確認 remote 存在）"
-    }
-}
-
-function Confirm-YesNo([string]$msg) {
+function Confirm-YesNo([string]$prompt) {
     while ($true) {
-        $ans = (Read-Host $msg).Trim().ToLower()
-        if ($ans -in @("y","yes")) { return $true }
-        if ($ans -in @("n","no")) { return $false }
+        $ans = Read-Host $prompt
+        if ($ans -match '^(y|Y)$') { return $true }
+        if ($ans -match '^(n|N)$') { return $false }
         Write-Host "請輸入 Y 或 N" -ForegroundColor Yellow
     }
 }
 
-function Get-ChangedFiles {
-    # 回傳相對路徑清單（含刪除）
-    $out = git status --porcelain 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $out) { return @() }
-
-    $files = @()
-    foreach ($l in $out) {
-        if ($l.Length -lt 4) { continue }
-        $path = $l.Substring(3).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($path)) {
-            $files += $path
-        }
-    }
-    return $files
-}
-
-function AutoCommit-IfAllowed([string]$reason, [string]$commitMessage) {
-    $changed = Get-ChangedFiles
-    if ($changed.Count -eq 0) { return }
-
-    $illegal = @($changed | Where-Object { $ALLOWED_AUTO_COMMIT -notcontains $_ })
-    if ($illegal.Count -gt 0) {
-        Write-Host "錯誤：偵測到非允許自動 commit 的變動，為了安全已中止：" -ForegroundColor Red
-        $illegal | ForEach-Object { Write-Host " - $_" }
-        throw "請先手動 commit/還原上述檔案後再發佈。"
-    }
-
-    Write-Host $reason -ForegroundColor Cyan
-    $changed | ForEach-Object { Write-Host " - $_" }
-
-    $doIt = Confirm-YesNo "是否要自動 commit 以上變動？(Y/N)"
-    if (-not $doIt) {
-        throw "你選擇不自動 commit。請手動處理變動後再重新執行。"
-    }
-
-    foreach ($f in $ALLOWED_AUTO_COMMIT) {
-        if (Test-Path $f) { git add $f 2>$null }
-    }
-
-    # 也要把刪除納入 staged
-    git add -u 2>$null
-
-    $st = git diff --cached --name-only 2>$null
-    if (-not $st) {
-        Write-Host "沒有 staged 變更，略過 commit。" -ForegroundColor Yellow
-        return
-    }
-
-    git commit -m $commitMessage
-    if ($LASTEXITCODE -ne 0) {
-        throw "git commit 失敗，請檢查衝突或 hook。"
-    }
-
-    # push（若遇到 non-fast-forward，先 rebase 再推）
-    $branch = (git branch --show-current).Trim()
-    if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "master" }
-
-    git fetch $REMOTE | Out-Null
-    git push $REMOTE HEAD
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "偵測到遠端比本機新，嘗試 git pull --rebase 後再推一次..." -ForegroundColor Yellow
-        git pull --rebase $REMOTE $branch
-        git push $REMOTE HEAD
-        if ($LASTEXITCODE -ne 0) {
-            throw "git push 仍失敗，請手動處理衝突後再重試。"
-        }
-    }
-}
-
-function Test-RemoteTagExists([string]$tag) {
-    $out = git ls-remote --tags $REMOTE "refs/tags/$tag" 2>$null
-    return (-not [string]::IsNullOrWhiteSpace($out))
+function Get-LocalLatestVersion {
+    $tags = git tag | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
+    if (-not $tags) { return $null }
+    $versions = $tags | ForEach-Object { $_ -replace '^v','' }
+    return ($versions | Sort-Object { [version]$_ } | Select-Object -Last 1)
 }
 
 function Get-RemoteLatestVersion {
     try {
-        git fetch origin --tags 2>$null | Out-Null
+        git fetch $REMOTE --tags 2>$null | Out-Null
     } catch {
         return $null
     }
 
     $tags = git tag | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
+    if (-not $tags) { return $null }
 
-    if (-not $tags) {
-        return $null
-    }
-
-    $versions = $tags | ForEach-Object {
-        $_ -replace '^v', ''
-    }
-
-    $latest = $versions |
-        Sort-Object { [version]$_ } |
-        Select-Object -Last 1
-
-    return $latest
+    $versions = $tags | ForEach-Object { $_ -replace '^v','' }
+    return ($versions | Sort-Object { [version]$_ } | Select-Object -Last 1)
 }
 
+function Prompt-Version([string]$latest) {
+    $msg = "請輸入要發佈的新版本號 (x.y.z)"
+    if ($latest) { $msg = "$msg，最新為 $latest" }
+    while ($true) {
+        $v = Read-Host $msg
+        if ($v -match '^\d+\.\d+\.\d+$') { return $v }
+        Write-Host "版本格式需為 x.y.z，例如 1.0.1" -ForegroundColor Yellow
+    }
+}
 
-function Get-LocalLatestVersion {
-    param(
-        [switch]$DebugOutput
+function Update-VersionFiles([string]$newVersion) {
+    $changed = @()
+
+    if (Test-Path ".\version.txt") {
+        Set-Content -Path ".\version.txt" -Value $newVersion -Encoding UTF8
+        $changed += "version.txt"
+    }
+
+    if (Test-Path ".\version.json") {
+        try {
+            $obj = Get-Content ".\version.json" -Raw | ConvertFrom-Json
+            if ($obj -and $obj.PSObject.Properties.Name -contains "version") {
+                $obj.version = $newVersion
+                ($obj | ConvertTo-Json -Depth 10) | Set-Content ".\version.json" -Encoding UTF8
+                $changed += "version.json"
+            } else {
+                # 沒有 version 欄位就不動它
+            }
+        } catch {
+            # version.json 不是標準 JSON 或其他原因，就不動它
+        }
+    }
+
+    if (Test-Path ".\manifest.json") {
+        try {
+            $m = Get-Content ".\manifest.json" -Raw | ConvertFrom-Json
+            $hasKey = $false
+            if ($m -and $m.PSObject.Properties.Name -contains "version") { $m.version = $newVersion; $hasKey = $true }
+            if ($m -and $m.PSObject.Properties.Name -contains "Version") { $m.Version = $newVersion; $hasKey = $true }
+
+            if ($hasKey) {
+                ($m | ConvertTo-Json -Depth 50) | Set-Content ".\manifest.json" -Encoding UTF8
+                $changed += "manifest.json"
+            } else {
+                Write-Host "警告：manifest.json 找不到 version/Version 欄位，已跳過更新（不影響打包）。" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "警告：manifest.json 解析失敗，已跳過更新（不影響打包）。" -ForegroundColor Yellow
+        }
+    }
+
+    return $changed
+}
+
+function Get-ChangedAllowedFiles {
+    # 只檢查允許清單內的異動（避免把不該 commit 的東西一起帶進去）
+    $allow = @(
+        "build_app.ps1",
+        "version.txt",
+        "version.json",
+        "manifest.json"
     )
-    $tags = @(git tag 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $tags -or $tags.Count -eq 0) {
-        if ($DebugOutput) { Write-Host "本地沒有任何 tags。" -ForegroundColor Yellow }
-        return $null
+
+    $status = git status --porcelain
+    if (-not $status) { return @() }
+
+    $changed = @()
+    foreach ($line in $status) {
+        $path = $line.Substring(3).Trim()
+        if ($allow -contains $path) { $changed += $path }
     }
-
-    if ($DebugOutput) {
-        Write-Host "本地 tags：" -ForegroundColor DarkGray
-        $tags | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor DarkGray }
-    }
-
-    $vers = New-Object System.Collections.Generic.List[string]
-    foreach ($t in $tags) {
-        if ($t -match "^(v?\d+\.\d+\.\d+)$") {
-            $v = $Matches[1].TrimStart("v")
-            if (Validate-SemVer $v) { $vers.Add($v) }
-        }
-    }
-
-    if ($vers.Count -eq 0) {
-        if ($DebugOutput) { Write-Host "本地沒有有效的 semver tags。" -ForegroundColor Yellow }
-        return $null
-    }
-
-    $uniq = $vers | Select-Object -Unique
-    $sorted = $uniq | Sort-Object `
-        @{ Expression = { [int]($_.Split('.')[0]) } }, `
-        @{ Expression = { [int]($_.Split('.')[1]) } }, `
-        @{ Expression = { [int]($_.Split('.')[2]) } }
-
-    return $sorted[-1]
+    return $changed | Select-Object -Unique
 }
 
-function Update-ManifestVersion([string]$path, [string]$next) {
-    if (-not (Test-Path $path)) { return }
+function Auto-Commit-IfNeeded([string[]]$files, [string]$reason, [string]$commitMessage) {
+    if (-not $files -or $files.Count -eq 0) { return }
 
-    try {
-        $raw = Get-Content $path -Raw -Encoding UTF8
-        $obj = $raw | ConvertFrom-Json
+    Write-Host "偵測到目前工作目錄有變動（允許清單內），可先自動 commit 後再繼續發佈：" -ForegroundColor Cyan
+    foreach ($f in $files) { Write-Host " - $f" }
+    $do = Confirm-YesNo "是否要自動 commit 以上變動？(Y/N)"
+    if (-not $do) { throw "已取消：請先自行 commit ($reason)" }
 
-        $props = $obj.PSObject.Properties.Name
-        if ($props -contains "version") {
-            $obj.version = $next
-        }
-        elseif ($props -contains "Version") {
-            $obj.Version = $next
-        }
-        else {
-            Write-Host "警告：manifest.json 找不到 version/Version 欄位，已跳過更新（不影響打包）。" -ForegroundColor Yellow
-            return
-        }
-
-        $obj | ConvertTo-Json -Depth 50 | Set-Content $path -Encoding UTF8
-    }
-    catch {
-        Write-Host "警告：更新 manifest.json 失敗，已跳過（不影響打包）。原因：$($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
-
-function Ensure-FileExists([string]$path, [string]$msgIfMissing) {
-    if (-not (Test-Path $path)) { throw $msgIfMissing }
+    git add -- $files
+    git commit -m $commitMessage
+    if ($LASTEXITCODE -ne 0) { throw "git commit 失敗" }
+    git push $REMOTE HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git push 失敗" }
 }
 
 function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
-    # 需要 GitHub CLI：gh auth login 先登入過
-    $gh = Get-Command gh -ErrorAction SilentlyContinue
-    if (-not $gh) {
-        Write-Host "找不到 gh CLI，已跳過自動上傳。你可以自行到 GitHub Release 上傳資產。" -ForegroundColor Yellow
-        return
-    }
-
-    Ensure-FileExists $zipPath "找不到要上傳的 zip：$zipPath"
-
-    $title = $tag
-    $notes = "Release $tag"
-
+    # 需要：GitHub CLI (gh) 已登入
     try {
+        $gh = Get-Command gh -ErrorAction SilentlyContinue
+        if (-not $gh) {
+            Write-Host "找不到 gh（GitHub CLI），已跳過自動上傳。" -ForegroundColor Yellow
+            return
+        }
+
+        $title = $tag
+        $notes = "Release $tag"
+
         gh release view $tag --repo "$GITHUB_OWNER/$GITHUB_REPO" *> $null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "Release 已存在，更新資產..." -ForegroundColor Cyan
@@ -262,95 +172,66 @@ function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
     }
 }
 
-# ================== 主流程 ==================
+# =====================================================
+# Main
+# =====================================================
 
-Ensure-GitRepo
-Ensure-RemoteOrigin
+# 先處理「腳本本身」若有改動：允許自動 commit
+$dirtyAllowed = Get-ChangedAllowedFiles
+Auto-Commit-IfNeeded `
+  -files $dirtyAllowed `
+  -reason "腳本或版本檔異動" `
+  -commitMessage "chore: update release script / version files"
 
-# 若有變動（且都在允許清單內）先自動 commit
-$changed = Get-ChangedFiles
-if ($changed.Count -gt 0) {
-    $illegal = @($changed | Where-Object { $ALLOWED_AUTO_COMMIT -notcontains $_ })
-    if ($illegal.Count -gt 0) {
-        Write-Host "錯誤：偵測到非允許自動 commit 的變動，為了安全已中止：" -ForegroundColor Red
-        $illegal | ForEach-Object { Write-Host " - $_" }
-        throw "請先手動 commit/還原上述檔案後再發佈。"
-    }
-
-    AutoCommit-IfAllowed `
-      -reason "偵測到目前工作目錄有變動（允許清單內），可先自動 commit 後再繼續發佈：" `
-      -commitMessage "chore: update release script / version files"
-}
-
-# 讀最新版本（優先遠端；遠端失敗再用本地）
+# 取得最新版本（優先遠端）
+Write-Host "正在獲取遠端 tags..." -ForegroundColor Cyan
 try {
-    Write-Host "正在獲取遠端 tags..." -ForegroundColor Cyan
     git fetch $REMOTE --tags 2>$null | Out-Null
     Write-Host "遠端 tags 獲取完成" -ForegroundColor Cyan
 } catch {
-    Write-Host "獲取遠端 tags 失敗: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "獲取遠端 tags 失敗: $_" -ForegroundColor Yellow
 }
 
-$VERSION_DEBUG = ($env:FH5BOT_VERSION_DEBUG -eq "1")
+$LATEST = Get-RemoteLatestVersion
+if (-not $LATEST) { $LATEST = Get-LocalLatestVersion }
 
-$LATEST = Get-RemoteLatestVersion -DebugOutput:$VERSION_DEBUG
-if (-not $LATEST) {
-    if ($VERSION_DEBUG) { Write-Host "遠端無版本或解析失敗，嘗試使用本地版本..." -ForegroundColor Yellow }
-    $LATEST = Get-LocalLatestVersion -DebugOutput:$VERSION_DEBUG
-}
+Write-Host ("GitHub 最新版本：{0}" -f ($LATEST ? $LATEST : "0"))
 
-Write-Host "GitHub 最新版本：" -NoNewline
-if ($LATEST) { Write-Host $LATEST -ForegroundColor Cyan }
-else { Write-Host "（尚無 tag 或取得失敗）" -ForegroundColor Yellow }
+# 輸入新版本
+$newVersion = Prompt-Version $LATEST
+$TAG = "v$newVersion"
+Write-Host "即將發佈版本：$newVersion" -ForegroundColor Green
 
-# 詢問新版本
-do {
-    $NEXT = Read-Host "請輸入要發佈的新版本號 (x.y.z)"
-    if (-not (Validate-SemVer $NEXT)) {
-        Write-Host "錯誤：版本格式錯誤，請使用 x.y.z" -ForegroundColor Red
-        $NEXT = $null
-    }
-} until ($NEXT)
-
-Write-Host "即將發佈版本：$NEXT" -ForegroundColor Cyan
-
-$TAG = "v$NEXT"
-
-# 避免 tag 重複
-if (Test-RemoteTagExists $TAG) {
-    throw "錯誤：遠端已存在 tag $TAG，請改用更高版本號。"
-}
-
-# ★ 產物改成 FH5Bot-<ver>.zip，避免你搞混
-$DIST_ZIP = Join-Path $SRC ("FH5Bot-" + $NEXT + ".zip")
-
-# 寫入版本
+# [1/8] 更新版本檔
 Write-Host "[1/8] 更新版本檔..."
-$NEXT | Set-Content "version.txt" -Encoding UTF8
-@{
-    version = $NEXT
-    source  = "manual"
-    tag     = $TAG
-    builtAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-} | ConvertTo-Json -Depth 4 | Set-Content "version.json" -Encoding UTF8
-Update-ManifestVersion -path ".\manifest.json" -next $NEXT
+$updatedFiles = Update-VersionFiles $newVersion
 
-# (B) 更新版本檔後：互動式自動 commit（只會包含版本檔/manifest/build_app.ps1）
-AutoCommit-IfAllowed `
-  -reason "版本檔已更新，建議先 commit 再打 tag/發佈：" `
-  -commitMessage "chore: release $TAG"
+# 若版本檔有異動，建議先 commit
+if ($updatedFiles -and $updatedFiles.Count -gt 0) {
+    Write-Host "版本檔已更新，建議先 commit 再打 tag/發佈：" -ForegroundColor Cyan
+    foreach ($f in $updatedFiles) { Write-Host " - $f" }
 
-# 建立 tag（本地）
+    $doCommit = Confirm-YesNo "是否要自動 commit 以上變動？(Y/N)"
+    if (-not $doCommit) { throw "已取消：請先自行 commit 版本檔再重新執行。" }
+
+    git add -- $updatedFiles
+    git commit -m "chore: release $TAG"
+    if ($LASTEXITCODE -ne 0) { throw "git commit 失敗" }
+    git push $REMOTE HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git push 失敗" }
+}
+
+# [2/8] 建立 tag（本地）
 Write-Host "[2/8] 建立 tag..."
 git tag $TAG
 if ($LASTEXITCODE -ne 0) { throw "建立 tag 失敗：$TAG" }
 
-# 推送 tag
+# [3/8] 推送 tag
 Write-Host "[3/8] 推送 tag..."
 git push $REMOTE $TAG
 if ($LASTEXITCODE -ne 0) { throw "推送 tag 失敗：$TAG" }
 
-# --------- 以下為打包流程（保持你原本邏輯） ---------
+# --------- 以下為打包流程 ---------
 
 $APP_RELEASE = Join-Path $SRC "app_release"
 
@@ -359,45 +240,56 @@ if (Test-Path $APP_RELEASE) { Remove-Item $APP_RELEASE -Recurse -Force }
 New-Item -ItemType Directory -Path $APP_RELEASE | Out-Null
 
 New-Item -ItemType Directory -Path (Join-Path $APP_RELEASE "bot") | Out-Null
+New-Item -ItemType Directory -Path (Join-Path (Join-Path $APP_RELEASE "bot") "__pycache__") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $APP_RELEASE "assets") | Out-Null
 
-# 你的實際專案：把 .py 編譯成 .pyc 並複製到 app_release
+# [4/8] 編譯 .py -> .pyc
 Write-Host "[4/8] 編譯 .py -> .pyc..."
 $PY = (Get-Command python -ErrorAction SilentlyContinue)
 if (-not $PY) { throw "找不到 python，請先安裝/設定 PATH" }
 
 python -m compileall . | Out-Null
 
-# 複製 Launcher.pyc（從 __pycache__ 取出）
+# [5/8] 複製 .pyc（__main__ + bot）
 Write-Host "[5/8] 複製 .pyc..."
-$LAUNCHER_PYCACHE = Join-Path $SRC "__pycache__"
+$LAUNCHER_PYCACHE = Join-Path $SRC "__pycache__"                 # 專案根目錄 __pycache__
 $BOT_PYCACHE      = Join-Path (Join-Path $SRC "bot") "__pycache__"
 
-Ensure-FileExists $LAUNCHER_PYCACHE "找不到 __pycache__：$LAUNCHER_PYCACHE（請確認 Launcher.py 有被 compileall 編譯）"
-Ensure-FileExists $BOT_PYCACHE      "找不到 bot\__pycache__：$BOT_PYCACHE（請確認 bot 模組有被 compileall 編譯）"
+Ensure-FileExists $LAUNCHER_PYCACHE "找不到 __pycache__：$LAUNCHER_PYCACHE（請確認已 compileall）"
+Ensure-FileExists $BOT_PYCACHE      "找不到 bot\__pycache__：$BOT_PYCACHE（請確認 bot 模組已 compileall）"
 
-# Launcher
-$launcherPyc = Get-ChildItem "$LAUNCHER_PYCACHE\Launcher*.pyc" -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $launcherPyc) { throw "找不到 Launcher 的 .pyc（__pycache__\Launcher*.pyc）" }
-Copy-Item $launcherPyc.FullName (Join-Path $APP_RELEASE "Launcher.pyc") -Force
+# __main__.pyc（entrypoint）
+$mainPyc = Get-ChildItem "$LAUNCHER_PYCACHE\__main__*.pyc" -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $mainPyc) { throw "找不到 __main__ 的 .pyc（__pycache__\__main__*.pyc）" }
+Copy-Item $mainPyc.FullName (Join-Path $APP_RELEASE "__main__.pyc") -Force
 
-# bot\*.pyc（改名去掉 cpython-311 後綴）
+# bot\__init__.py（確保 bot 是 package）
+if (-not (Test-Path ".\bot\__init__.py")) { throw "找不到 bot\__init__.py" }
+Copy-Item ".\bot\__init__.py" (Join-Path (Join-Path $APP_RELEASE "bot") "__init__.py") -Force
+
+# bot\__pycache__\__init__*.pyc（保留原檔名，例如 __init__.cpython-311.pyc）
+$initPyc = Get-ChildItem "$BOT_PYCACHE\__init__*.pyc" -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $initPyc) { throw "找不到 bot 的 __init__.pyc（bot\__pycache__\__init__*.pyc）" }
+Copy-Item $initPyc.FullName (Join-Path (Join-Path (Join-Path $APP_RELEASE "bot") "__pycache__") $initPyc.Name) -Force
+
+# bot\*.pyc（改名去掉 cpython-311 後綴，放在 bot\ 目錄）
 Get-ChildItem "$BOT_PYCACHE\*.pyc" | ForEach-Object {
     $name = ($_.BaseName -replace '\.cpython-\d+$','') + ".pyc"
     Copy-Item $_.FullName (Join-Path (Join-Path $APP_RELEASE "bot") $name) -Force
 }
 
-# 資源
+# [6/8] 複製資源
 Write-Host "[6/8] 複製資源..."
 Ensure-FileExists ".\assets" "找不到 .\assets，請確認資源資料夾存在。"
 Copy-Item ".\assets\*" (Join-Path $APP_RELEASE "assets") -Recurse -Force
 if (Test-Path ".\default_config.json") { Copy-Item ".\default_config.json" $APP_RELEASE -Force }
 if (Test-Path ".\manifest.json")       { Copy-Item ".\manifest.json"       $APP_RELEASE -Force }
 if (Test-Path ".\version.txt")         { Copy-Item ".\version.txt"         $APP_RELEASE -Force }
-if (Test-Path ".\version.json")        { Copy-Item ".\version.json"        $APP_RELEASE -Force }
+# (已移除) 不再打包 version.json
 
-# 打包 zip（只打包 app_release 的內容，確保 GitHub 也一致）
+# [7/8] 打包 zip（只打包 app_release 的內容）
 Write-Host "[7/8] 打包 zip..."
+$DIST_ZIP = Join-Path $DIST_DIR ("FH5Bot_{0}.zip" -f $TAG)
 if (Test-Path $DIST_ZIP) { Remove-Item $DIST_ZIP -Force }
 Compress-Archive -Path (Join-Path $APP_RELEASE "*") -DestinationPath $DIST_ZIP -Force
 
@@ -405,7 +297,7 @@ Write-Host "=== 本機打包完成 ===" -ForegroundColor Green
 Write-Host "產出檔案：" $DIST_ZIP
 Write-Host "GitHub tag：" $TAG
 
-# 是否要自動建立/更新 GitHub Release 並上傳資產
+# [8/8] 是否上傳 GitHub Release
 $doUpload = Confirm-YesNo "是否要建立/更新 GitHub Release 並上傳這包 zip？(Y/N)"
 if ($doUpload) {
     Try-Upload-GitHubRelease -tag $TAG -zipPath $DIST_ZIP
