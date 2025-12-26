@@ -78,7 +78,8 @@ function Get-ChangedAllowedFiles {
     $allow = @(
         "build_app.ps1",
         "version.txt",
-        "manifest.json"
+        "manifest.json",
+		".gitignore"
     )
 
     $status = git status --porcelain
@@ -101,12 +102,17 @@ function Auto-Commit-IfNeeded([string[]]$files, [string]$reason, [string]$commit
     $do = Confirm-YesNo "是否要自動 commit 以上變動？(Y/N)"
     if (-not $do) { throw "已取消：請先自行 commit ($reason)" }
 
-    git add -- $files | Out-Null
+    # ✅ 加入允許清單內的檔案（包含 untracked）
+    foreach ($f in $files) {
+        if (Test-Path $f) {
+            git add -- $f | Out-Null
+        }
+    }
 
-    # ✅ 關鍵保護：如果沒有任何 staged 內容，就不要 commit
+    # ✅ 如果沒有任何 staged 內容，直接跳過 commit（不當錯誤）
     git diff --cached --quiet
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "提示：允許清單內的檔案沒有任何可提交變更，已跳過 commit。" -ForegroundColor Yellow
+        Write-Host "提示：允許清單內沒有任何可提交變更，已跳過 commit。" -ForegroundColor Yellow
         return
     }
 
@@ -116,6 +122,7 @@ function Auto-Commit-IfNeeded([string[]]$files, [string]$reason, [string]$commit
     git push $REMOTE HEAD
     if ($LASTEXITCODE -ne 0) { throw "git push 失敗" }
 }
+
 
 
 function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
