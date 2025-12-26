@@ -1,0 +1,8 @@
+# build artifacts
+app_release/
+dist/
+
+# python cache
+__pycache__/
+*/__pycache__/
+*.pyc
