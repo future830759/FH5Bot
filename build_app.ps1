@@ -79,7 +79,7 @@ function Get-ChangedAllowedFiles {
         "build_app.ps1",
         "version.txt",
         "manifest.json",
-		".gitignore"
+        ".gitignore"
     )
 
     $status = git status --porcelain
@@ -87,11 +87,17 @@ function Get-ChangedAllowedFiles {
 
     $changed = @()
     foreach ($line in $status) {
+        # porcelain 可能是：
+        #  M file
+        # ?? file
+        # D  file
+        #  D file
         $path = $line.Substring(3).Trim()
         if ($allow -contains $path) { $changed += $path }
     }
     return $changed | Select-Object -Unique
 }
+
 
 function Auto-Commit-IfNeeded([string[]]$files, [string]$reason, [string]$commitMessage) {
     if (-not $files -or $files.Count -eq 0) { return }
@@ -102,26 +108,27 @@ function Auto-Commit-IfNeeded([string[]]$files, [string]$reason, [string]$commit
     $do = Confirm-YesNo "是否要自動 commit 以上變動？(Y/N)"
     if (-not $do) { throw "已取消：請先自行 commit ($reason)" }
 
-    # ✅ 加入允許清單內的檔案（包含 untracked）
+    # ✅ stage 允許清單內的檔案（包含 untracked）
     foreach ($f in $files) {
         if (Test-Path $f) {
             git add -- $f | Out-Null
         }
     }
 
-    # ✅ 如果沒有任何 staged 內容，直接跳過 commit（不當錯誤）
+    # ✅ 關鍵：沒任何 staged 變更就直接跳過（不要 commit、不要 throw）
     git diff --cached --quiet
     if ($LASTEXITCODE -eq 0) {
         Write-Host "提示：允許清單內沒有任何可提交變更，已跳過 commit。" -ForegroundColor Yellow
         return
     }
 
-    git commit -m $commitMessage
+    git commit -m $commitMessage | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "git commit 失敗" }
 
-    git push $REMOTE HEAD
+    git push $REMOTE HEAD | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "git push 失敗" }
 }
+
 
 
 
