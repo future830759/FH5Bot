@@ -35,30 +35,9 @@ function Confirm-YesNo([string]$prompt) {
     }
 }
 
-function Get-LocalLatestVersion {
-    $tags = git tag | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
-    if (-not $tags) { return $null }
-    $versions = $tags | ForEach-Object { $_ -replace '^v','' }
-    return ($versions | Sort-Object { [version]$_ } | Select-Object -Last 1)
-}
-
-function Get-RemoteLatestVersion {
-    try {
-        git fetch $REMOTE --tags 2>$null | Out-Null
-    } catch {
-        return $null
-    }
-
-    $tags = git tag | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
-    if (-not $tags) { return $null }
-
-    $versions = $tags | ForEach-Object { $_ -replace '^v','' }
-    return ($versions | Sort-Object { [version]$_ } | Select-Object -Last 1)
-}
-
-function Prompt-Version([string]$latest) {
+function Prompt-Version([string]$latestRemote) {
     $msg = "請輸入要發佈的新版本號 (x.y.z)"
-    if ($latest) { $msg = "$msg，最新為 $latest" }
+    if ($latestRemote) { $msg = "$msg，遠端最新為 $latestRemote" }
     while ($true) {
         $v = Read-Host $msg
         if ($v -match '^\d+\.\d+\.\d+$') { return $v }
@@ -173,6 +152,60 @@ function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
 }
 
 # =====================================================
+# Tags：只信遠端 + 執行時同步本地 tags（刪掉遠端已刪除者）
+# =====================================================
+function Sync-TagsFromRemote {
+    Write-Host "正在同步遠端 tags（包含清掉本地已不存在的 tags）..." -ForegroundColor Cyan
+
+    # 優先：新版 git 支援 prune-tags
+    git fetch $REMOTE --tags --prune --prune-tags 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "遠端 tags 同步完成（使用 --prune-tags）。" -ForegroundColor Cyan
+        return
+    }
+
+    # fallback：舊 git 不支援 --prune-tags
+    Write-Host "提示：你的 git 可能不支援 --prune-tags，改用 fallback 同步法。" -ForegroundColor Yellow
+
+    # 1) 取遠端 tags
+    $remoteTags = @{}
+    git ls-remote --tags $REMOTE 2>$null | ForEach-Object {
+        # 格式：<sha>\trefs/tags/v1.0.0  或 refs/tags/v1.0.0^{}
+        $parts = $_ -split "\s+"
+        if ($parts.Count -lt 2) { return }
+        $ref = $parts[1]
+        if ($ref -match '^refs/tags/(.+)$') {
+            $t = $Matches[1]
+            # 去掉 annotated tag 的 ^{}
+            $t = $t -replace '\^\{\}$',''
+            if ($t) { $remoteTags[$t] = $true }
+        }
+    }
+
+    # 2) 刪掉本地多餘 tags（只針對 vX.Y.Z）
+    $localTags = git tag | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
+    foreach ($t in $localTags) {
+        if (-not $remoteTags.ContainsKey($t)) {
+            Write-Host "刪除本地殘留 tag：$t" -ForegroundColor Yellow
+            git tag -d $t 2>$null | Out-Null
+        }
+    }
+
+    # 3) 再 fetch tags（補齊遠端 tags）
+    git fetch $REMOTE --tags 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "同步遠端 tags 失敗（fallback）" }
+
+    Write-Host "遠端 tags 同步完成（fallback）。" -ForegroundColor Cyan
+}
+
+function Get-RemoteLatestVersionOnly {
+    $tags = git tag | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
+    if (-not $tags) { return $null }
+    $versions = $tags | ForEach-Object { $_ -replace '^v','' }
+    return ($versions | Sort-Object { [version]$_ } | Select-Object -Last 1)
+}
+
+# =====================================================
 # Main
 # =====================================================
 
@@ -183,19 +216,12 @@ Auto-Commit-IfNeeded `
   -reason "腳本或版本檔異動" `
   -commitMessage "chore: update release script / version files"
 
-# 取得最新版本（優先遠端）
-Write-Host "正在獲取遠端 tags..." -ForegroundColor Cyan
-try {
-    git fetch $REMOTE --tags 2>$null | Out-Null
-    Write-Host "遠端 tags 獲取完成" -ForegroundColor Cyan
-} catch {
-    Write-Host "獲取遠端 tags 失敗: $_" -ForegroundColor Yellow
-}
+# ✅ 只信遠端：執行時同步 tags（包含刪掉本地殘留）
+Sync-TagsFromRemote
 
-$LATEST = Get-RemoteLatestVersion
-if (-not $LATEST) { $LATEST = Get-LocalLatestVersion }
-
-Write-Host ("GitHub 最新版本：{0}" -f ($LATEST ? $LATEST : "0"))
+# ✅ 只用遠端同步後的結果（不再 fallback 本地）
+$LATEST = Get-RemoteLatestVersionOnly
+Write-Host ("GitHub 最新版本（遠端）：{0}" -f ($LATEST ? $LATEST : "0"))
 
 # 輸入新版本
 $newVersion = Prompt-Version $LATEST
