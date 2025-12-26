@@ -97,15 +97,26 @@ function Auto-Commit-IfNeeded([string[]]$files, [string]$reason, [string]$commit
 
     Write-Host "偵測到目前工作目錄有變動（允許清單內），可先自動 commit 後再繼續發佈：" -ForegroundColor Cyan
     foreach ($f in $files) { Write-Host " - $f" }
+
     $do = Confirm-YesNo "是否要自動 commit 以上變動？(Y/N)"
     if (-not $do) { throw "已取消：請先自行 commit ($reason)" }
 
-    git add -- $files
+    git add -- $files | Out-Null
+
+    # ✅ 關鍵保護：如果沒有任何 staged 內容，就不要 commit
+    git diff --cached --quiet
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "提示：允許清單內的檔案沒有任何可提交變更，已跳過 commit。" -ForegroundColor Yellow
+        return
+    }
+
     git commit -m $commitMessage
     if ($LASTEXITCODE -ne 0) { throw "git commit 失敗" }
+
     git push $REMOTE HEAD
     if ($LASTEXITCODE -ne 0) { throw "git push 失敗" }
 }
+
 
 function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
     try {
