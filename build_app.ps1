@@ -18,6 +18,16 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     exit 1
 }
 
+function Get-DefaultRemoteName {
+    # 優先使用 origin，否則取第一個 remote
+    $remotes = @(git remote 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $remotes -or $remotes.Count -eq 0) { return "origin" }
+    if ($remotes -contains "origin") { return "origin" }
+    return $remotes[0]
+}
+
+$REMOTE = Get-DefaultRemoteName
+
 # ================== 參數 / 專案設定 ==================
 $SRC = (Get-Location).Path
 
@@ -26,15 +36,6 @@ $GITHUB_REPO  = "FH5Bot"
 
 # 允許自動 commit 的檔案（版本 + 發佈腳本本身）
 $ALLOWED_AUTO_COMMIT = @("version.txt", "version.json", "manifest.json", "build_app.ps1")
-
-function Get-DefaultRemoteName {
-    $remotes = @(git remote 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $remotes -or $remotes.Count -eq 0) { return "origin" }
-    if ($remotes -contains "origin") { return "origin" }
-    return $remotes[0]
-}
-
-$REMOTE = Get-DefaultRemoteName
 
 # ---------- functions ----------
 function Validate-SemVer([string]$v) {
@@ -50,10 +51,10 @@ function Ensure-GitRepo {
 }
 
 function Ensure-RemoteOrigin {
-    # 兼容舊函式名稱：改用自動偵測到的 $REMOTE
+    # 兼容舊函式名稱：實際檢查使用自動偵測到的 $REMOTE
     $u = git remote get-url $REMOTE 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($u)) {
-        throw "找不到 remote '$REMOTE'。請先設定：git remote add $REMOTE <repo-url>"
+        throw "找不到 remote '$REMOTE'。請先設定：git remote add origin <repo-url>（或確認 remote 存在）"
     }
 }
 
@@ -123,6 +124,7 @@ function AutoCommit-IfAllowed([string]$reason, [string]$commitMessage) {
     $branch = (git branch --show-current).Trim()
     if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "master" }
 
+    git fetch $REMOTE | Out-Null
     git push $REMOTE HEAD
     if ($LASTEXITCODE -ne 0) {
         Write-Host "偵測到遠端比本機新，嘗試 git pull --rebase 後再推一次..." -ForegroundColor Yellow
@@ -140,44 +142,91 @@ function Test-RemoteTagExists([string]$tag) {
 }
 
 function Get-RemoteLatestVersion {
-    # 直接用遠端 tags（不依賴 GitHub API / 不需要 Release）
-    # 回傳 semver（不含 v），例如 1.0.2
+    param(
+        [switch]$DebugOutput
+    )
+
+    if ($DebugOutput) {
+        Write-Host "正在從遠端獲取 tags（remote=$REMOTE）..." -ForegroundColor Cyan
+    }
+
     $lines = git ls-remote --tags $REMOTE 2>$null
+
+    if ($DebugOutput) {
+        Write-Host "遠端原始輸出（ls-remote --tags）：" -ForegroundColor DarkGray
+        if ($lines) {
+            $lines | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor DarkGray }
+        } else {
+            Write-Host "  （空）" -ForegroundColor DarkGray
+        }
+        Write-Host ("LASTEXITCODE=" + $LASTEXITCODE) -ForegroundColor DarkGray
+    }
+
     if ($LASTEXITCODE -ne 0 -or -not $lines) { return $null }
 
-    $vers = @()
+    $vers = New-Object System.Collections.Generic.List[string]
     foreach ($l in $lines) {
-        # 同時支援 lightweight / annotated tag（可能會出現 ^{}）
+        # 支援：
+        # refs/tags/v1.0.0
+        # refs/tags/v1.0.0^{}   （annotated tag 可能出現這行）
         if ($l -match "refs/tags/(v?\d+\.\d+\.\d+)(\^\{\})?$") {
-            $v = $Matches[1].TrimStart("v")
-            if (Validate-SemVer $v) { $vers += $v }
+            $tag = $Matches[1]
+            $v = $tag.TrimStart("v")
+            if (Validate-SemVer $v) {
+                $vers.Add($v)
+                if ($DebugOutput) { Write-Host "  匹配到 tag=$tag -> version=$v" -ForegroundColor DarkGray }
+            }
+        } elseif ($DebugOutput) {
+            Write-Host "  未匹配：$l" -ForegroundColor DarkGray
         }
     }
-    if ($vers.Count -eq 0) { return $null }
 
-    $sorted = $vers | Sort-Object `
+    if ($vers.Count -eq 0) {
+        if ($DebugOutput) { Write-Host "沒有找到有效的遠端版本號（semver tag）。" -ForegroundColor Yellow }
+        return $null
+    }
+
+    $uniq = $vers | Select-Object -Unique
+    $sorted = $uniq | Sort-Object `
         @{ Expression = { [int]($_.Split('.')[0]) } }, `
         @{ Expression = { [int]($_.Split('.')[1]) } }, `
         @{ Expression = { [int]($_.Split('.')[2]) } }
 
-    return $sorted[-1]
+    $latest = $sorted[-1]
+    if ($DebugOutput) { Write-Host "遠端最新版本：$latest" -ForegroundColor Cyan }
+    return $latest
 }
 
 function Get-LocalLatestVersion {
-    # 讀本地 tags（需先 git fetch --tags）
+    param(
+        [switch]$DebugOutput
+    )
     $tags = @(git tag 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $tags -or $tags.Count -eq 0) { return $null }
+    if ($LASTEXITCODE -ne 0 -or -not $tags -or $tags.Count -eq 0) {
+        if ($DebugOutput) { Write-Host "本地沒有任何 tags。" -ForegroundColor Yellow }
+        return $null
+    }
 
-    $vers = @()
+    if ($DebugOutput) {
+        Write-Host "本地 tags：" -ForegroundColor DarkGray
+        $tags | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor DarkGray }
+    }
+
+    $vers = New-Object System.Collections.Generic.List[string]
     foreach ($t in $tags) {
         if ($t -match "^(v?\d+\.\d+\.\d+)$") {
             $v = $Matches[1].TrimStart("v")
-            if (Validate-SemVer $v) { $vers += $v }
+            if (Validate-SemVer $v) { $vers.Add($v) }
         }
     }
-    if ($vers.Count -eq 0) { return $null }
 
-    $sorted = $vers | Sort-Object `
+    if ($vers.Count -eq 0) {
+        if ($DebugOutput) { Write-Host "本地沒有有效的 semver tags。" -ForegroundColor Yellow }
+        return $null
+    }
+
+    $uniq = $vers | Select-Object -Unique
+    $sorted = $uniq | Sort-Object `
         @{ Expression = { [int]($_.Split('.')[0]) } }, `
         @{ Expression = { [int]($_.Split('.')[1]) } }, `
         @{ Expression = { [int]($_.Split('.')[2]) } }
@@ -196,19 +245,27 @@ function Update-ManifestVersion([string]$path, [string]$next) {
         if ($props -contains "version") {
             $obj.version = $next
         }
+        elseif ($props -contains "Version") {
+            $obj.Version = $next
+        }
+        else {
+            Write-Host "警告：manifest.json 找不到 version/Version 欄位，已跳過更新（不影響打包）。" -ForegroundColor Yellow
+            return
+        }
 
         $obj | ConvertTo-Json -Depth 50 | Set-Content $path -Encoding UTF8
-    } catch {
-        Write-Host "警告：更新 $path 版本失敗：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Host "警告：更新 manifest.json 失敗，已跳過（不影響打包）。原因：$($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
-function Ensure-FileExists([string]$path, [string]$msg) {
-    if (-not (Test-Path $path)) { throw $msg }
+function Ensure-FileExists([string]$path, [string]$msgIfMissing) {
+    if (-not (Test-Path $path)) { throw $msgIfMissing }
 }
 
 function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
-    # 需要 gh CLI
+    # 需要 GitHub CLI：gh auth login 先登入過
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if (-not $gh) {
         Write-Host "找不到 gh CLI，已跳過自動上傳。你可以自行到 GitHub Release 上傳資產。" -ForegroundColor Yellow
@@ -219,16 +276,19 @@ function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
 
     $title = $tag
     $notes = "Release $tag"
+
     try {
         gh release view $tag --repo "$GITHUB_OWNER/$GITHUB_REPO" *> $null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "Release 已存在，更新資產..." -ForegroundColor Cyan
             gh release upload $tag $zipPath --clobber --repo "$GITHUB_OWNER/$GITHUB_REPO"
-        } else {
+        }
+        else {
             Write-Host "建立 Release..." -ForegroundColor Cyan
             gh release create $tag $zipPath -t $title -n $notes --repo "$GITHUB_OWNER/$GITHUB_REPO"
         }
-    } catch {
+    }
+    catch {
         Write-Host "gh release 操作失敗：$($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
@@ -238,7 +298,7 @@ function Try-Upload-GitHubRelease([string]$tag, [string]$zipPath) {
 Ensure-GitRepo
 Ensure-RemoteOrigin
 
-# （A）先看工作目錄是否有變動：如果只有允許清單內，提供自動 commit
+# 若有變動（且都在允許清單內）先自動 commit
 $changed = Get-ChangedFiles
 if ($changed.Count -gt 0) {
     $illegal = @($changed | Where-Object { $ALLOWED_AUTO_COMMIT -notcontains $_ })
@@ -253,10 +313,22 @@ if ($changed.Count -gt 0) {
       -commitMessage "chore: update release script / version files"
 }
 
-# 讀最新版本（tag）：先 fetch tags，再優先用本地 tags（避免 ls-remote 失敗造成顯示 0）
-try { git fetch $REMOTE --tags 2>$null | Out-Null } catch {}
-$LATEST = Get-LocalLatestVersion
-if (-not $LATEST) { $LATEST = Get-RemoteLatestVersion }
+# 讀最新版本（優先遠端；遠端失敗再用本地）
+try {
+    Write-Host "正在獲取遠端 tags..." -ForegroundColor Cyan
+    git fetch $REMOTE --tags 2>$null | Out-Null
+    Write-Host "遠端 tags 獲取完成" -ForegroundColor Cyan
+} catch {
+    Write-Host "獲取遠端 tags 失敗: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+$VERSION_DEBUG = ($env:FH5BOT_VERSION_DEBUG -eq "1")
+
+$LATEST = Get-RemoteLatestVersion -DebugOutput:$VERSION_DEBUG
+if (-not $LATEST) {
+    if ($VERSION_DEBUG) { Write-Host "遠端無版本或解析失敗，嘗試使用本地版本..." -ForegroundColor Yellow }
+    $LATEST = Get-LocalLatestVersion -DebugOutput:$VERSION_DEBUG
+}
 
 Write-Host "GitHub 最新版本：" -NoNewline
 if ($LATEST) { Write-Host $LATEST -ForegroundColor Cyan }
@@ -265,7 +337,6 @@ else { Write-Host "（尚無 tag 或取得失敗）" -ForegroundColor Yellow }
 # 詢問新版本
 do {
     $NEXT = Read-Host "請輸入要發佈的新版本號 (x.y.z)"
-    if ($NEXT.StartsWith("v")) { $NEXT = $NEXT.Substring(1) }
     if (-not (Validate-SemVer $NEXT)) {
         Write-Host "錯誤：版本格式錯誤，請使用 x.y.z" -ForegroundColor Red
         $NEXT = $null
@@ -276,13 +347,12 @@ Write-Host "即將發佈版本：$NEXT" -ForegroundColor Cyan
 
 $TAG = "v$NEXT"
 
-# 避免重複 tag
+# 避免 tag 重複
 if (Test-RemoteTagExists $TAG) {
     throw "錯誤：遠端已存在 tag $TAG，請改用更高版本號。"
 }
 
 # ★ 產物改成 FH5Bot-<ver>.zip，避免你搞混
-$APP_RELEASE = Join-Path $SRC "app_release"
 $DIST_ZIP = Join-Path $SRC ("FH5Bot-" + $NEXT + ".zip")
 
 # 寫入版本
@@ -312,6 +382,8 @@ git push $REMOTE $TAG
 if ($LASTEXITCODE -ne 0) { throw "推送 tag 失敗：$TAG" }
 
 # --------- 以下為打包流程（保持你原本邏輯） ---------
+
+$APP_RELEASE = Join-Path $SRC "app_release"
 
 # 路徑準備
 if (Test-Path $APP_RELEASE) { Remove-Item $APP_RELEASE -Recurse -Force }
