@@ -1,4 +1,4 @@
-﻿﻿# =====================================================
+﻿# =====================================================
 # FH5Bot 發佈腳本（互動式 Auto Commit + 可選 GitHub Release 上傳）
 # 目的：本機打包的 zip = GitHub Release 資產 zip（完全一致）
 # =====================================================
@@ -142,60 +142,29 @@ function Test-RemoteTagExists([string]$tag) {
 }
 
 function Get-RemoteLatestVersion {
-    param(
-        [switch]$DebugOutput
-    )
-
-    if ($DebugOutput) {
-        Write-Host "正在從遠端獲取 tags（remote=$REMOTE）..." -ForegroundColor Cyan
-    }
-
-    $lines = git ls-remote --tags $REMOTE 2>$null
-
-    if ($DebugOutput) {
-        Write-Host "遠端原始輸出（ls-remote --tags）：" -ForegroundColor DarkGray
-        if ($lines) {
-            $lines | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor DarkGray }
-        } else {
-            Write-Host "  （空）" -ForegroundColor DarkGray
-        }
-        Write-Host ("LASTEXITCODE=" + $LASTEXITCODE) -ForegroundColor DarkGray
-    }
-
-    if ($LASTEXITCODE -ne 0 -or -not $lines) { return $null }
-
-    $vers = New-Object System.Collections.Generic.List[string]
-    foreach ($l in $lines) {
-        # 支援：
-        # refs/tags/v1.0.0
-        # refs/tags/v1.0.0^{}   （annotated tag 可能出現這行）
-        if ($l -match "refs/tags/(v?\d+\.\d+\.\d+)(\^\{\})?$") {
-            $tag = $Matches[1]
-            $v = $tag.TrimStart("v")
-            if (Validate-SemVer $v) {
-                $vers.Add($v)
-                if ($DebugOutput) { Write-Host "  匹配到 tag=$tag -> version=$v" -ForegroundColor DarkGray }
-            }
-        } elseif ($DebugOutput) {
-            Write-Host "  未匹配：$l" -ForegroundColor DarkGray
-        }
-    }
-
-    if ($vers.Count -eq 0) {
-        if ($DebugOutput) { Write-Host "沒有找到有效的遠端版本號（semver tag）。" -ForegroundColor Yellow }
+    try {
+        git fetch origin --tags 2>$null | Out-Null
+    } catch {
         return $null
     }
 
-    $uniq = $vers | Select-Object -Unique
-    $sorted = $uniq | Sort-Object `
-        @{ Expression = { [int]($_.Split('.')[0]) } }, `
-        @{ Expression = { [int]($_.Split('.')[1]) } }, `
-        @{ Expression = { [int]($_.Split('.')[2]) } }
+    $tags = git tag | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
 
-    $latest = $sorted[-1]
-    if ($DebugOutput) { Write-Host "遠端最新版本：$latest" -ForegroundColor Cyan }
+    if (-not $tags) {
+        return $null
+    }
+
+    $versions = $tags | ForEach-Object {
+        $_ -replace '^v', ''
+    }
+
+    $latest = $versions |
+        Sort-Object { [version]$_ } |
+        Select-Object -Last 1
+
     return $latest
 }
+
 
 function Get-LocalLatestVersion {
     param(
