@@ -37,7 +37,6 @@ function Confirm-YesNo([string]$prompt) {
 
 function Prompt-Version([string]$latestRemote) {
     $msg = "請輸入要發佈的新版本號 (x.y.z)"
-    if ($latestRemote) { $msg = "$msg，遠端最新為 $latestRemote" }
     while ($true) {
         $v = Read-Host $msg
         if ($v -match '^\d+\.\d+\.\d+$') { return $v }
